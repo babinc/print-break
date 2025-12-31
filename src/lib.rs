@@ -41,6 +41,8 @@
 use std::fmt::Debug;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::Instant;
 
 /// Global flag to skip all remaining breakpoints
 static SKIP_ALL: AtomicBool = AtomicBool::new(false);
@@ -48,8 +50,410 @@ static SKIP_ALL: AtomicBool = AtomicBool::new(false);
 /// Global breakpoint counter
 static BREAK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Last breakpoint timestamp for elapsed time
+static LAST_BREAK_TIME: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Border style characters
+#[derive(Clone, Copy)]
+pub struct BorderStyle {
+    pub top_left: char,
+    pub top_right: char,
+    pub bottom_left: char,
+    pub bottom_right: char,
+    pub horizontal: char,
+    pub vertical: char,
+    pub tee_right: char,
+}
+
+impl BorderStyle {
+    pub const ROUNDED: Self = Self {
+        top_left: '╭',
+        top_right: '╮',
+        bottom_left: '╰',
+        bottom_right: '╯',
+        horizontal: '─',
+        vertical: '│',
+        tee_right: '├',
+    };
+
+    pub const SHARP: Self = Self {
+        top_left: '┌',
+        top_right: '┐',
+        bottom_left: '└',
+        bottom_right: '┘',
+        horizontal: '─',
+        vertical: '│',
+        tee_right: '├',
+    };
+
+    pub const DOUBLE: Self = Self {
+        top_left: '╔',
+        top_right: '╗',
+        bottom_left: '╚',
+        bottom_right: '╝',
+        horizontal: '═',
+        vertical: '║',
+        tee_right: '╠',
+    };
+
+    pub const ASCII: Self = Self {
+        top_left: '+',
+        top_right: '+',
+        bottom_left: '+',
+        bottom_right: '+',
+        horizontal: '-',
+        vertical: '|',
+        tee_right: '+',
+    };
+}
+
+/// Get border style from environment variable
+#[doc(hidden)]
+pub fn get_border_style() -> BorderStyle {
+    match std::env::var("PRINT_BREAK_STYLE").as_deref() {
+        Ok("round") | Ok("rounded") => BorderStyle::ROUNDED,
+        Ok("sharp") => BorderStyle::SHARP,
+        Ok("double") => BorderStyle::DOUBLE,
+        Ok("ascii") => BorderStyle::ASCII,
+        _ => BorderStyle::ROUNDED,
+    }
+}
+
+// ============================================================================
+// Colors - Centralized ANSI color codes
+// ============================================================================
+
+/// ANSI color codes for terminal output
+#[derive(Clone, Copy)]
+pub struct Colors {
+    pub green: &'static str,
+    pub cyan: &'static str,
+    pub yellow: &'static str,
+    pub magenta: &'static str,
+    pub white: &'static str,
+    pub gray: &'static str,
+    pub red: &'static str,
+    pub reset: &'static str,
+}
+
+impl Colors {
+    const TTY: Self = Self {
+        green: "\x1b[1;32m",
+        cyan: "\x1b[36m",
+        yellow: "\x1b[1;33m",
+        magenta: "\x1b[35m",
+        white: "\x1b[37m",
+        gray: "\x1b[90m",
+        red: "\x1b[1;31m",
+        reset: "\x1b[0m",
+    };
+
+    const PLAIN: Self = Self {
+        green: "",
+        cyan: "",
+        yellow: "",
+        magenta: "",
+        white: "",
+        gray: "",
+        red: "",
+        reset: "",
+    };
+
+    /// Get colors based on TTY detection
+    #[inline]
+    pub fn get() -> Self {
+        if is_tty() { Self::TTY } else { Self::PLAIN }
+    }
+}
+
+/// Format elapsed duration for display
+#[doc(hidden)]
+pub fn format_elapsed(d: std::time::Duration) -> String {
+    let c = Colors::get();
+    let micros = d.as_micros();
+    if micros < 1000 {
+        format!(" {}+{}µs{}", c.gray, micros, c.reset)
+    } else if micros < 1_000_000 {
+        format!(" {}+{:.1}ms{}", c.gray, micros as f64 / 1000.0, c.reset)
+    } else {
+        format!(" {}+{:.2}s{}", c.gray, micros as f64 / 1_000_000.0, c.reset)
+    }
+}
+
+/// Get elapsed time since last breakpoint
+#[doc(hidden)]
+pub fn get_elapsed() -> Option<std::time::Duration> {
+    if let Ok(guard) = LAST_BREAK_TIME.lock() {
+        guard.map(|t| t.elapsed())
+    } else {
+        None
+    }
+}
+
+/// Update last breakpoint time
+#[doc(hidden)]
+pub fn update_break_time() {
+    if let Ok(mut guard) = LAST_BREAK_TIME.lock() {
+        *guard = Some(Instant::now());
+    }
+}
+
 /// Maximum lines to show before truncating
 const MAX_LINES: usize = 50;
+
+/// Colorize JSON output
+fn colorize_json(s: &str) -> String {
+    let c = Colors::get();
+    if c.cyan.is_empty() {
+        return s.to_string();
+    }
+
+    let (cyan, magenta, yellow, gray, reset) = (c.cyan, c.magenta, c.yellow, c.gray, c.reset);
+
+    let mut result = String::new();
+    let mut in_string = false;
+    let mut is_key = true;
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if !in_string => {
+                in_string = true;
+                let color = if is_key { cyan } else { magenta };
+                result.push_str(color);
+                result.push('"');
+            }
+            '"' if in_string => {
+                result.push('"');
+                result.push_str(reset);
+                in_string = false;
+            }
+            ':' if !in_string => {
+                result.push_str(gray);
+                result.push(':');
+                result.push_str(reset);
+                is_key = false;
+            }
+            ',' if !in_string => {
+                result.push_str(gray);
+                result.push(',');
+                result.push_str(reset);
+                is_key = true;
+            }
+            '{' | '}' | '[' | ']' if !in_string => {
+                result.push_str(gray);
+                result.push(c);
+                result.push_str(reset);
+                if c == '{' || c == '[' {
+                    is_key = c == '{';
+                }
+            }
+            '0'..='9' | '-' | '.' if !in_string => {
+                result.push_str(yellow);
+                result.push(c);
+                // Continue collecting the number
+                while let Some(&next) = chars.peek() {
+                    if next.is_ascii_digit() || next == '.' || next == 'e' || next == 'E' || next == '+' || next == '-' {
+                        result.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+                result.push_str(reset);
+            }
+            't' if !in_string => {
+                // Check for "true"
+                let rest: String = chars.by_ref().take(3).collect();
+                if rest == "rue" {
+                    result.push_str(yellow);
+                    result.push_str("true");
+                    result.push_str(reset);
+                } else {
+                    result.push('t');
+                    result.push_str(&rest);
+                }
+            }
+            'f' if !in_string => {
+                // Check for "false"
+                let rest: String = chars.by_ref().take(4).collect();
+                if rest == "alse" {
+                    result.push_str(yellow);
+                    result.push_str("false");
+                    result.push_str(reset);
+                } else {
+                    result.push('f');
+                    result.push_str(&rest);
+                }
+            }
+            'n' if !in_string => {
+                // Check for "null"
+                let rest: String = chars.by_ref().take(3).collect();
+                if rest == "ull" {
+                    result.push_str(yellow);
+                    result.push_str("null");
+                    result.push_str(reset);
+                } else {
+                    result.push('n');
+                    result.push_str(&rest);
+                }
+            }
+            _ => result.push(c),
+        }
+    }
+
+    result
+}
+
+/// Colorize TOML output
+fn colorize_toml(s: &str) -> String {
+    let c = Colors::get();
+    if c.cyan.is_empty() {
+        return s.to_string();
+    }
+
+    let (green, cyan, magenta, yellow, gray, reset) =
+        (c.green, c.cyan, c.magenta, c.yellow, c.gray, c.reset);
+
+    let mut result = String::new();
+
+    for line in s.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            // Section header
+            result.push_str(green);
+            result.push_str(line);
+            result.push_str(reset);
+        } else if let Some(eq_pos) = trimmed.find(" = ") {
+            // Key = value
+            let indent = &line[..line.len() - trimmed.len()];
+            let key = &trimmed[..eq_pos];
+            let value = &trimmed[eq_pos + 3..];
+
+            result.push_str(indent);
+            result.push_str(cyan);
+            result.push_str(key);
+            result.push_str(reset);
+            result.push_str(gray);
+            result.push_str(" = ");
+            result.push_str(reset);
+            result.push_str(&colorize_toml_value(value, magenta, yellow, gray, reset));
+        } else {
+            result.push_str(line);
+        }
+        result.push('\n');
+    }
+
+    result.trim_end().to_string()
+}
+
+fn colorize_toml_value(s: &str, magenta: &str, yellow: &str, gray: &str, reset: &str) -> String {
+    let trimmed = s.trim();
+
+    if trimmed.starts_with('"') && trimmed.ends_with('"') {
+        format!("{}{}{}", magenta, trimmed, reset)
+    } else if trimmed == "true" || trimmed == "false" || trimmed.parse::<f64>().is_ok() {
+        format!("{}{}{}", yellow, trimmed, reset)
+    } else if trimmed.starts_with('[') {
+        // Array - colorize elements
+        let mut result = format!("{}[{}", gray, reset);
+        let inner = &trimmed[1..trimmed.len()-1];
+        let parts: Vec<&str> = inner.split(", ").collect();
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                result.push_str(&format!("{}, {}", gray, reset));
+            }
+            result.push_str(&colorize_toml_value(part, magenta, yellow, gray, reset));
+        }
+        result.push_str(&format!("{}]{}", gray, reset));
+        result
+    } else {
+        s.to_string()
+    }
+}
+
+/// Colorize YAML output
+fn colorize_yaml(s: &str) -> String {
+    let c = Colors::get();
+    if c.cyan.is_empty() {
+        return s.to_string();
+    }
+
+    let (cyan, magenta, yellow, gray, reset) = (c.cyan, c.magenta, c.yellow, c.gray, c.reset);
+
+    let mut result = String::new();
+
+    for line in s.lines() {
+        if let Some(colon_pos) = line.find(':') {
+            let before_colon = &line[..colon_pos];
+            let after_colon = &line[colon_pos + 1..];
+
+            // Check if this is a key (not a list item continuation)
+            let trimmed_before = before_colon.trim_start_matches([' ', '-']);
+
+            if !trimmed_before.is_empty() && !trimmed_before.starts_with('#') {
+                let indent = &before_colon[..before_colon.len() - trimmed_before.len()];
+
+                // Handle "- key:" pattern
+                if indent.contains('-') {
+                    let dash_pos = indent.find('-').unwrap();
+                    result.push_str(&indent[..dash_pos]);
+                    result.push_str(gray);
+                    result.push('-');
+                    result.push_str(reset);
+                    result.push_str(&indent[dash_pos + 1..]);
+                } else {
+                    result.push_str(indent);
+                }
+
+                result.push_str(cyan);
+                result.push_str(trimmed_before);
+                result.push_str(reset);
+                result.push_str(gray);
+                result.push(':');
+                result.push_str(reset);
+
+                // Colorize value
+                let value = after_colon.trim();
+                if !value.is_empty() {
+                    result.push(' ');
+                    result.push_str(&colorize_yaml_value(value, magenta, yellow, reset));
+                }
+            } else {
+                result.push_str(line);
+            }
+        } else if line.trim().starts_with('-') {
+            // List item
+            let trimmed = line.trim();
+            let indent = &line[..line.len() - trimmed.len()];
+            result.push_str(indent);
+            result.push_str(gray);
+            result.push('-');
+            result.push_str(reset);
+            result.push_str(&colorize_yaml_value(trimmed[1..].trim(), magenta, yellow, reset));
+        } else {
+            result.push_str(line);
+        }
+        result.push('\n');
+    }
+
+    result.trim_end().to_string()
+}
+
+fn colorize_yaml_value(s: &str, magenta: &str, yellow: &str, reset: &str) -> String {
+    let trimmed = s.trim();
+
+    if trimmed.starts_with('"') || trimmed.starts_with('\'') {
+        format!("{}{}{}", magenta, trimmed, reset)
+    } else if matches!(trimmed, "true" | "false" | "null" | "~") || trimmed.parse::<f64>().is_ok() {
+        format!("{}{}{}", yellow, trimmed, reset)
+    } else if !trimmed.is_empty() && !trimmed.contains(':') {
+        // Unquoted string
+        format!("{}{}{}", magenta, trimmed, reset)
+    } else {
+        s.to_string()
+    }
+}
 
 /// Check if print-break is enabled via environment variable
 #[doc(hidden)]
@@ -73,18 +477,6 @@ pub fn is_tty() -> bool {
 #[doc(hidden)]
 pub fn next_break_id() -> usize {
     BREAK_COUNT.fetch_add(1, Ordering::Relaxed) + 1
-}
-
-/// Color code wrapper - returns empty string if not TTY
-#[doc(hidden)]
-pub fn color(code: &str) -> &str {
-    if is_tty() { code } else { "" }
-}
-
-/// Reset color code - returns empty string if not TTY
-#[doc(hidden)]
-pub fn reset() -> &'static str {
-    if is_tty() { "\x1b[0m" } else { "" }
 }
 
 /// Set the skip-all flag
@@ -112,11 +504,15 @@ pub fn format_value<T: Debug>(value: &T) -> String {
 
         let trimmed = unescaped.trim();
 
+        let c = Colors::get();
+        let (gray, reset) = (c.gray, c.reset);
+
         // Try JSON first (most specific - must start with { or [)
         if trimmed.starts_with('{') || trimmed.starts_with('[') {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&unescaped) {
                 if let Ok(pretty) = serde_json::to_string_pretty(&json) {
-                    raw_output = format!("\x1b[90m(json)\x1b[0m\n{}", pretty);
+                    let colorized = colorize_json(&pretty);
+                    raw_output = format!("{}(json){}\n{}", gray, reset, colorized);
                     return truncate_output(&raw_output);
                 }
             }
@@ -126,7 +522,8 @@ pub fn format_value<T: Debug>(value: &T) -> String {
         if trimmed.contains(" = ") || trimmed.contains("]\n") || trimmed.starts_with('[') {
             if let Ok(toml_val) = toml::from_str::<toml::Value>(&unescaped) {
                 if let Ok(pretty) = toml::to_string_pretty(&toml_val) {
-                    raw_output = format!("\x1b[90m(toml)\x1b[0m\n{}", pretty);
+                    let colorized = colorize_toml(&pretty);
+                    raw_output = format!("{}(toml){}\n{}", gray, reset, colorized);
                     return truncate_output(&raw_output);
                 }
             }
@@ -138,7 +535,8 @@ pub fn format_value<T: Debug>(value: &T) -> String {
                 // Only use YAML if it parsed into something structured (not just a string)
                 if yaml_val.is_mapping() || yaml_val.is_sequence() {
                     if let Ok(pretty) = serde_yaml::to_string(&yaml_val) {
-                        raw_output = format!("\x1b[90m(yaml)\x1b[0m\n{}", pretty.trim());
+                        let colorized = colorize_yaml(pretty.trim());
+                        raw_output = format!("{}(yaml){}\n{}", gray, reset, colorized);
                         return truncate_output(&raw_output);
                     }
                 }
@@ -146,7 +544,7 @@ pub fn format_value<T: Debug>(value: &T) -> String {
         }
 
         // For plain text strings, show with newlines and word wrap
-        raw_output = format!("\x1b[90m(string, {} chars)\x1b[0m\n{}", unescaped.len(), word_wrap(&unescaped, 80));
+        raw_output = format!("{}(string, {} chars){}\n{}", gray, unescaped.len(), reset, word_wrap(&unescaped, 80));
         return truncate_output(&raw_output);
     }
 
@@ -222,20 +620,13 @@ fn max_depth() -> usize {
 
 /// Colorize Debug output for structs/enums
 fn colorize_debug(s: &str) -> String {
-    let tty = is_tty();
-    if !tty {
+    let c = Colors::get();
+    if c.cyan.is_empty() {
         return s.to_string();
     }
 
-    let (green, cyan, yellow, magenta, white, gray, reset) = (
-        "\x1b[1;32m", // struct/enum names
-        "\x1b[36m",   // field names
-        "\x1b[33m",   // numbers
-        "\x1b[35m",   // strings
-        "\x1b[37m",   // other values
-        "\x1b[90m",   // punctuation/guides
-        "\x1b[0m",
-    );
+    let (green, cyan, yellow, magenta, white, gray, reset) =
+        (c.green, c.cyan, c.yellow, c.magenta, c.white, c.gray, c.reset);
 
     let mut result = String::new();
     let lines: Vec<&str> = s.lines().collect();
@@ -275,7 +666,7 @@ fn colorize_debug(s: &str) -> String {
             }
 
             // Show collapsed version
-            let name = trimmed.trim_end_matches(|c| c == '{' || c == '[' || c == '(' || c == ' ');
+            let name = trimmed.trim_end_matches(['{', '[', '(', ' ']);
             if !name.is_empty() {
                 result.push_str(&format!("{}{}{} {}{{ ... }}{}", green, name, reset, gray, reset));
             } else {
@@ -296,7 +687,7 @@ fn colorize_debug(s: &str) -> String {
         // Colorize the content
         if opens {
             // Struct/enum name line: "User {" or "Some(" or "["
-            let name = trimmed.trim_end_matches(|c| c == '{' || c == '[' || c == '(' || c == ' ');
+            let name = trimmed.trim_end_matches(['{', '[', '(', ' ']);
             let bracket = trimmed.chars().last().unwrap_or(' ');
             if !name.is_empty() {
                 result.push_str(&format!("{}{}{} {}{}{}", green, name, reset, gray, bracket, reset));
@@ -385,11 +776,9 @@ fn word_wrap(s: &str, width: usize) -> String {
 fn truncate_output(s: &str) -> String {
     let lines: Vec<&str> = s.lines().collect();
     if lines.len() > MAX_LINES {
-        let mut result: Vec<&str> = lines[..MAX_LINES].to_vec();
-        result.push(&format!("\x1b[90m... ({} more lines)\x1b[0m", lines.len() - MAX_LINES));
-        // Can't use format! in const context, so we do this differently
-        let truncated: String = lines[..MAX_LINES].join("\n");
-        format!("{}\n\x1b[90m... ({} more lines)\x1b[0m", truncated, lines.len() - MAX_LINES)
+        let c = Colors::get();
+        let truncated = lines[..MAX_LINES].join("\n");
+        format!("{}\n{}... ({} more lines){}", truncated, c.gray, lines.len() - MAX_LINES, c.reset)
     } else {
         s.to_string()
     }
@@ -406,6 +795,119 @@ pub fn store_full_output(output: String) {
     }
 }
 
+/// Show help menu
+fn show_help() {
+    eprintln!("\n\x1b[1;33m─── print-break Help ───\x1b[0m");
+    eprintln!("\x1b[36mEnter\x1b[0m     Continue to next breakpoint");
+    eprintln!("\x1b[36mm\x1b[0m         Show full output (if truncated)");
+    eprintln!("\x1b[36mt\x1b[0m         Show stack trace");
+    eprintln!("\x1b[36mc\x1b[0m         Copy last value to clipboard");
+    eprintln!("\x1b[36ms\x1b[0m         Skip all remaining breakpoints");
+    eprintln!("\x1b[36mq\x1b[0m         Quit the program");
+    eprintln!("\x1b[36mh / ?\x1b[0m     Show this help");
+    eprintln!();
+    eprintln!("\x1b[90mEnvironment variables:\x1b[0m");
+    eprintln!("  \x1b[36mPRINT_BREAK=0\x1b[0m          Disable all breakpoints");
+    eprintln!("  \x1b[36mPRINT_BREAK_DEPTH=N\x1b[0m    Max nesting depth (default: 4)");
+    eprintln!("  \x1b[36mPRINT_BREAK_STYLE=X\x1b[0m    Border style: rounded, sharp, double, ascii");
+    eprintln!("\x1b[1;33m─────────────────────────\x1b[0m\n");
+}
+
+/// Show stack trace
+fn show_stack_trace() {
+    eprintln!("\n\x1b[1;33m─── Stack Trace ───\x1b[0m");
+
+    let bt = backtrace::Backtrace::new();
+    let mut in_relevant = false;
+    let mut count = 0;
+
+    for frame in bt.frames() {
+        for symbol in frame.symbols() {
+            if let Some(name) = symbol.name() {
+                let name_str = name.to_string();
+
+                // Skip internal frames
+                if name_str.contains("print_break::") || name_str.contains("backtrace::") {
+                    continue;
+                }
+
+                // Start showing after we exit print_break internals
+                if !in_relevant && !name_str.contains("print_break") {
+                    in_relevant = true;
+                }
+
+                if in_relevant {
+                    let file = symbol.filename()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    let line = symbol.lineno().unwrap_or(0);
+
+                    // Simplify long paths
+                    let short_file = file.rsplit('/').next().unwrap_or(&file);
+
+                    if !name_str.contains("std::") && !name_str.contains("core::") && !name_str.contains("__rust") {
+                        eprintln!("\x1b[90m{:>3}.\x1b[0m \x1b[36m{}\x1b[0m", count, name_str);
+                        if !file.is_empty() && line > 0 {
+                            eprintln!("      \x1b[90mat {}:{}\x1b[0m", short_file, line);
+                        }
+                        count += 1;
+
+                        if count >= 15 {
+                            eprintln!("\x1b[90m     ... (truncated)\x1b[0m");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if count >= 15 {
+            break;
+        }
+    }
+
+    eprintln!("\x1b[1;33m───────────────────\x1b[0m\n");
+}
+
+/// Copy text to clipboard using system commands
+fn copy_to_clipboard(text: &str) -> bool {
+    use std::process::{Command, Stdio};
+    use std::io::Write as IoWrite;
+
+    // Try different clipboard commands based on platform
+    let commands = if cfg!(target_os = "macos") {
+        vec![("pbcopy", vec![])]
+    } else if cfg!(target_os = "windows") {
+        vec![("clip", vec![])]
+    } else {
+        // Linux - try multiple options
+        vec![
+            ("xclip", vec!["-selection", "clipboard"]),
+            ("xsel", vec!["--clipboard", "--input"]),
+            ("wl-copy", vec![]),
+        ]
+    };
+
+    for (cmd, args) in commands {
+        if let Ok(mut child) = Command::new(cmd)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                if stdin.write_all(text.as_bytes()).is_ok() {
+                    drop(stdin);
+                    if child.wait().map(|s| s.success()).unwrap_or(false) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Handle user input at breakpoint. Returns true if should continue, false if should quit.
 #[doc(hidden)]
 pub fn handle_input() -> bool {
@@ -418,7 +920,7 @@ pub fn handle_input() -> bool {
     }
 
     loop {
-        eprint!("\x1b[90m[Enter=continue, m=more, s=skip all, q=quit]\x1b[0m ");
+        eprint!("\x1b[90m[Enter, m=more, t=trace, c=copy, s=skip, q=quit, h=help]\x1b[0m ");
         io::stderr().flush().unwrap();
 
         let stdin = io::stdin();
@@ -448,7 +950,31 @@ pub fn handle_input() -> bool {
                             eprintln!("\x1b[90m(no truncated output to show)\x1b[0m");
                         }
                     }
-                    continue; // Ask for input again
+                    continue;
+                }
+                "t" | "trace" => {
+                    show_stack_trace();
+                    continue;
+                }
+                "c" | "copy" => {
+                    if let Ok(guard) = LAST_FULL_OUTPUT.lock() {
+                        if let Some(ref full) = *guard {
+                            // Strip ANSI codes for clipboard
+                            let clean = strip_ansi_codes(full);
+                            if copy_to_clipboard(&clean) {
+                                eprintln!("\x1b[1;32mCopied to clipboard!\x1b[0m");
+                            } else {
+                                eprintln!("\x1b[1;31mFailed to copy (install xclip or xsel)\x1b[0m");
+                            }
+                        } else {
+                            eprintln!("\x1b[90m(nothing to copy)\x1b[0m");
+                        }
+                    }
+                    continue;
+                }
+                "h" | "?" | "help" => {
+                    show_help();
+                    continue;
                 }
                 _ => break // Continue
             }
@@ -458,6 +984,26 @@ pub fn handle_input() -> bool {
     }
     eprintln!();
     true
+}
+
+/// Strip ANSI escape codes from a string
+fn strip_ansi_codes(s: &str) -> String {
+    let mut result = String::new();
+    let mut in_escape = false;
+
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+        } else if in_escape {
+            if c == 'm' {
+                in_escape = false;
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
 }
 
 /// Pretty-prints variables and pauses execution until Enter is pressed.
@@ -491,49 +1037,45 @@ pub fn handle_input() -> bool {
 macro_rules! print_break {
     () => {{
         if $crate::is_enabled() {
-            use std::io::Write;
-
             let break_id = $crate::next_break_id();
+            let elapsed_str = $crate::get_elapsed().map($crate::format_elapsed).unwrap_or_default();
+            $crate::update_break_time();
+
             let location = format!("{}:{}", file!(), line!());
             let width = 50;
-            let tty = $crate::is_tty();
+            let border = $crate::get_border_style();
+            let c = $crate::Colors::get();
 
-            let (yellow, cyan, reset) = if tty {
-                ("\x1b[1;33m", "\x1b[36m", "\x1b[0m")
-            } else {
-                ("", "", "")
-            };
+            let h = border.horizontal.to_string();
 
             eprintln!();
-            eprintln!("{}┌─ BREAK #{} {}{}", yellow, break_id, "─".repeat(width - 12 - break_id.to_string().len()), reset);
-            eprintln!("{}│{} {}{:<width$}{}{}│{}", yellow, reset, cyan, location, reset, yellow, reset, width = width - 2);
-            eprintln!("{}└{}{}", yellow, "─".repeat(width), reset);
+            eprintln!("{}{}{} BREAK #{} {}{}{}", c.yellow, border.top_left, h, break_id, elapsed_str, h.repeat(width - 14 - break_id.to_string().len() - elapsed_str.len() / 3), c.reset);
+            eprintln!("{}{}{} {}{}{}", c.yellow, border.vertical, c.reset, c.cyan, location, c.reset);
+            eprintln!("{}{}{}{}", c.yellow, border.bottom_left, h.repeat(width), c.reset);
 
             $crate::handle_input();
         }
     }};
     ($($var:expr),+ $(,)?) => {{
         if $crate::is_enabled() {
-            use std::io::Write;
-
             let break_id = $crate::next_break_id();
+            let elapsed_str = $crate::get_elapsed().map($crate::format_elapsed).unwrap_or_default();
+            $crate::update_break_time();
+
             let location = format!("{}:{}", file!(), line!());
             let width = 50;
-            let tty = $crate::is_tty();
-
-            let (yellow, cyan, green, white, reset) = if tty {
-                ("\x1b[1;33m", "\x1b[36m", "\x1b[1;32m", "\x1b[37m", "\x1b[0m")
-            } else {
-                ("", "", "", "", "")
-            };
+            let border = $crate::get_border_style();
+            let c = $crate::Colors::get();
 
             // Collect full output for "more" option
             let mut full_output = String::new();
 
+            let h = border.horizontal.to_string();
+
             eprintln!();
-            eprintln!("{}┌─ BREAK #{} {}{}", yellow, break_id, "─".repeat(width - 12 - break_id.to_string().len()), reset);
-            eprintln!("{}│{} {}{:<width$}{}{}│{}", yellow, reset, cyan, location, reset, yellow, reset, width = width - 2);
-            eprintln!("{}├{}{}", yellow, "─".repeat(width), reset);
+            eprintln!("{}{}{} BREAK #{} {}{}{}", c.yellow, border.top_left, h, break_id, elapsed_str, h.repeat(width - 14 - break_id.to_string().len() - elapsed_str.len() / 3), c.reset);
+            eprintln!("{}{}{} {}{}{}", c.yellow, border.vertical, c.reset, c.cyan, location, c.reset);
+            eprintln!("{}{}{}{}", c.yellow, border.tee_right, h.repeat(width), c.reset);
 
             $(
                 let formatted = $crate::format_value(&$var);
@@ -543,18 +1085,18 @@ macro_rules! print_break {
                 full_output.push_str(&format!("{} = {}\n\n", name, $crate::format_value_full(&$var)));
 
                 if formatted.contains('\n') {
-                    eprintln!("{}│{} {}{}{}=", yellow, reset, green, name, reset);
+                    eprintln!("{}{}{} {}{}{}=", c.yellow, border.vertical, c.reset, c.green, name, c.reset);
                     for line in formatted.lines() {
-                        eprintln!("{}│{}   {}{}{}", yellow, reset, white, line, reset);
+                        eprintln!("{}{}{} {}{}{}", c.yellow, border.vertical, c.reset, c.white, line, c.reset);
                     }
                 } else {
-                    eprintln!("{}│{} {}{}{} = {}{}{}", yellow, reset, green, name, reset, white, formatted, reset);
+                    eprintln!("{}{}{} {}{}{} = {}{}{}", c.yellow, border.vertical, c.reset, c.green, name, c.reset, c.white, formatted, c.reset);
                 }
             )+
 
             $crate::store_full_output(full_output);
 
-            eprintln!("{}└{}{}", yellow, "─".repeat(width), reset);
+            eprintln!("{}{}{}{}", c.yellow, border.bottom_left, h.repeat(width), c.reset);
             $crate::handle_input();
         }
     }};

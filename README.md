@@ -5,14 +5,17 @@ A simple Rust debugging macro that pretty-prints variables and pauses execution.
 ## Features
 
 - **Pretty-prints any `Debug` type** with syntax highlighting
-- **Auto-detects JSON, TOML, YAML** strings and formats them nicely
+- **Auto-detects JSON, TOML, YAML** strings and formats them with colors
 - **Pauses execution** until you press Enter
 - **Compiles to nothing in release builds** - zero overhead in production
 - **Disable at runtime** with `PRINT_BREAK=0`
-- **Interactive controls**: continue, quit, skip remaining, show more
+- **Interactive controls**: continue, quit, skip, more, help
+- **Stack traces** - press `t` to see how you got there
+- **Clipboard support** - press `c` to copy values
+- **Elapsed time** - see time between breakpoints
 - **Conditional breakpoints** with `print_break_if!`
 - **Non-TTY safe** - won't hang in CI/piped output
-- **Breakpoint counter** - know which breakpoint you're at
+- **Customizable borders** - rounded, sharp, double, or ASCII
 
 ## Installation
 
@@ -66,8 +69,11 @@ When paused at a breakpoint:
 |-----|--------|
 | **Enter** | Continue to next breakpoint |
 | **m** | Show full output (if truncated) |
+| **t** | Show stack trace |
+| **c** | Copy value to clipboard |
 | **s** | Skip all remaining breakpoints |
 | **q** | Quit the program |
+| **h / ?** | Show help |
 
 ## Environment Variables
 
@@ -83,6 +89,10 @@ PRINT_BREAK_DEPTH=6 cargo run
 
 # Show all nesting (no collapse)
 PRINT_BREAK_DEPTH=999 cargo run
+
+# Border styles: rounded (default), sharp, double, ascii
+PRINT_BREAK_STYLE=double cargo run
+PRINT_BREAK_STYLE=ascii cargo run
 ```
 
 ## CI / Non-Interactive Mode
