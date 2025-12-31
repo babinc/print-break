@@ -29,6 +29,7 @@
 //!
 //! - `PRINT_BREAK=0` - Disable all breakpoints
 //! - `PRINT_BREAK=1` - Enable breakpoints (default)
+//! - `PRINT_BREAK_DEPTH=N` - Max nesting depth before collapsing (default: 4)
 //!
 //! ## Interactive Controls
 //!
@@ -149,8 +150,9 @@ pub fn format_value<T: Debug>(value: &T) -> String {
         return truncate_output(&raw_output);
     }
 
-    // Fall back to pretty Debug format
-    raw_output = format!("{:#?}", value);
+    // Fall back to pretty Debug format with colorization
+    let debug_output = format!("{:#?}", value);
+    raw_output = colorize_debug(&debug_output);
     truncate_output(&raw_output)
 }
 
@@ -203,7 +205,150 @@ pub fn format_value_full<T: Debug>(value: &T) -> String {
         return word_wrap(&unescaped, 100);
     }
 
-    format!("{:#?}", value)
+    // Colorize debug output
+    colorize_debug(&format!("{:#?}", value))
+}
+
+/// Default maximum nesting depth before collapsing
+const DEFAULT_MAX_DEPTH: usize = 4;
+
+/// Get max depth from environment variable or use default
+fn max_depth() -> usize {
+    std::env::var("PRINT_BREAK_DEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_DEPTH)
+}
+
+/// Colorize Debug output for structs/enums
+fn colorize_debug(s: &str) -> String {
+    let tty = is_tty();
+    if !tty {
+        return s.to_string();
+    }
+
+    let (green, cyan, yellow, magenta, white, gray, reset) = (
+        "\x1b[1;32m", // struct/enum names
+        "\x1b[36m",   // field names
+        "\x1b[33m",   // numbers
+        "\x1b[35m",   // strings
+        "\x1b[37m",   // other values
+        "\x1b[90m",   // punctuation/guides
+        "\x1b[0m",
+    );
+
+    let mut result = String::new();
+    let lines: Vec<&str> = s.lines().collect();
+    let mut current_depth: usize = 0;
+    let mut skip_until_depth: Option<usize> = None;
+
+    for line in lines {
+        let trimmed = line.trim_start();
+        let indent_count = line.len() - trimmed.len();
+        let indent_level = indent_count / 4;
+
+        // Track depth changes
+        let opens = trimmed.ends_with('{') || trimmed.ends_with('[') || trimmed.ends_with("({");
+        let closes = trimmed.starts_with('}') || trimmed.starts_with(']') || trimmed.starts_with(')');
+
+        if closes {
+            current_depth = current_depth.saturating_sub(1);
+        }
+
+        // Check if we're skipping due to depth
+        if let Some(skip_depth) = skip_until_depth {
+            if current_depth < skip_depth {
+                skip_until_depth = None;
+            } else {
+                if opens {
+                    current_depth += 1;
+                }
+                continue;
+            }
+        }
+
+        // If we're at max depth and opening a new block, collapse it
+        if opens && current_depth >= max_depth() {
+            // Add indentation guides
+            for _ in 0..indent_level {
+                result.push_str(&format!("{}│{} ", gray, reset));
+            }
+
+            // Show collapsed version
+            let name = trimmed.trim_end_matches(|c| c == '{' || c == '[' || c == '(' || c == ' ');
+            if !name.is_empty() {
+                result.push_str(&format!("{}{}{} {}{{ ... }}{}", green, name, reset, gray, reset));
+            } else {
+                result.push_str(&format!("{}[ ... ]{}", gray, reset));
+            }
+            result.push('\n');
+
+            skip_until_depth = Some(current_depth);
+            current_depth += 1;
+            continue;
+        }
+
+        // Add indentation guides
+        for _ in 0..indent_level {
+            result.push_str(&format!("{}│{} ", gray, reset));
+        }
+
+        // Colorize the content
+        if opens {
+            // Struct/enum name line: "User {" or "Some(" or "["
+            let name = trimmed.trim_end_matches(|c| c == '{' || c == '[' || c == '(' || c == ' ');
+            let bracket = trimmed.chars().last().unwrap_or(' ');
+            if !name.is_empty() {
+                result.push_str(&format!("{}{}{} {}{}{}", green, name, reset, gray, bracket, reset));
+            } else {
+                result.push_str(&format!("{}{}{}", gray, bracket, reset));
+            }
+            current_depth += 1;
+        } else if closes || trimmed.ends_with("},") || trimmed.ends_with("],") || trimmed.ends_with("),") {
+            // Closing brace
+            result.push_str(&format!("{}{}{}", gray, trimmed, reset));
+        } else if trimmed.contains(": ") {
+            // Field: value line
+            if let Some(colon_pos) = trimmed.find(": ") {
+                let field = &trimmed[..colon_pos];
+                let value = &trimmed[colon_pos + 2..];
+                let colored_value = colorize_value(value, yellow, magenta, white, gray, reset);
+                result.push_str(&format!("{}{}{}{}: {}", cyan, field, reset, gray, colored_value));
+            } else {
+                result.push_str(trimmed);
+            }
+        } else {
+            // Array element or other
+            let colored = colorize_value(trimmed, yellow, magenta, white, gray, reset);
+            result.push_str(&colored);
+        }
+        result.push('\n');
+    }
+
+    result.trim_end().to_string()
+}
+
+/// Colorize a single value
+fn colorize_value(s: &str, yellow: &str, magenta: &str, white: &str, gray: &str, reset: &str) -> String {
+    let trimmed = s.trim_end_matches(',');
+    let has_comma = s.ends_with(',');
+    let comma = if has_comma { format!("{},{}", gray, reset) } else { String::new() };
+
+    if trimmed.starts_with('"') {
+        // String value
+        format!("{}{}{}{}", magenta, trimmed, reset, comma)
+    } else if trimmed.parse::<f64>().is_ok() || trimmed.starts_with('-') && trimmed[1..].parse::<f64>().is_ok() {
+        // Number
+        format!("{}{}{}{}", yellow, trimmed, reset, comma)
+    } else if trimmed == "true" || trimmed == "false" {
+        // Boolean
+        format!("{}{}{}{}", yellow, trimmed, reset, comma)
+    } else if trimmed == "None" || trimmed.starts_with("Some(") {
+        // Option
+        format!("{}{}{}{}", white, trimmed, reset, comma)
+    } else {
+        format!("{}{}{}{}", white, trimmed, reset, comma)
+    }
 }
 
 /// Word wrap text at specified width
