@@ -77,6 +77,12 @@ PRINT_BREAK=0 cargo run
 
 # Re-enable (default)
 PRINT_BREAK=1 cargo run
+
+# Set max nesting depth for structs (default: 4)
+PRINT_BREAK_DEPTH=6 cargo run
+
+# Show all nesting (no collapse)
+PRINT_BREAK_DEPTH=999 cargo run
 ```
 
 ## CI / Non-Interactive Mode
@@ -116,6 +122,31 @@ Strings are automatically detected and pretty-printed:
 - **Plain text** - Word-wrapped at 80 characters
 
 Long output is truncated at 50 lines. Press `m` to see the full output.
+
+## Editor Integration
+
+### Neovim
+
+Copy `editors/nvim/print-break.lua` to your Neovim config:
+
+```bash
+cp editors/nvim/print-break.lua ~/.config/nvim/after/plugin/
+```
+
+**Keybindings (Rust files only):**
+
+| Key | Mode | Action |
+|-----|------|--------|
+| `<leader>pb` | Normal | Insert `print_break!()` with word under cursor |
+| `<leader>pb` | Visual | Wrap selection in `print_break!()` |
+| `<leader>pB` | Normal | Insert `print_break_if!(condition, vars)` |
+| `<leader>pc` | Normal | Remove all `print_break!` from current buffer |
+| `<leader>pC` | Normal | Remove all `print_break!` from all Rust files |
+
+**Smart features:**
+- Automatically captures the variable under cursor
+- Appends to existing `print_break!` if one exists on the next line
+- Finds end of multi-line statements before inserting
 
 ## License
 
