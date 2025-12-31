@@ -214,6 +214,8 @@ fn colorize_json(s: &str) -> String {
     let mut in_string = false;
     let mut is_key = true;
     let mut chars = s.chars().peekable();
+    // Track nesting: true = object (has keys), false = array (no keys)
+    let mut context_stack: Vec<bool> = Vec::new();
 
     while let Some(c) = chars.next() {
         match c {
@@ -238,15 +240,22 @@ fn colorize_json(s: &str) -> String {
                 result.push_str(gray);
                 result.push(',');
                 result.push_str(reset);
-                is_key = true;
+                // After comma, next string is a key only if we're in an object
+                is_key = context_stack.last().copied().unwrap_or(true);
             }
-            '{' | '}' | '[' | ']' if !in_string => {
+            '{' | '[' if !in_string => {
                 result.push_str(gray);
                 result.push(c);
                 result.push_str(reset);
-                if c == '{' || c == '[' {
-                    is_key = c == '{';
-                }
+                let is_object = c == '{';
+                context_stack.push(is_object);
+                is_key = is_object;
+            }
+            '}' | ']' if !in_string => {
+                result.push_str(gray);
+                result.push(c);
+                result.push_str(reset);
+                context_stack.pop();
             }
             '0'..='9' | '-' | '.' if !in_string => {
                 result.push_str(yellow);
