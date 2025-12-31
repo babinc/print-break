@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "A simple debugging macro that pretty-prints variables and pauses execution"
 license = "MIT"
-repository = "https://github.com/carman/print-break"
+repository = "https://github.com/babinc/print-break"
 keywords = ["debug", "breakpoint", "print", "macro"]
 categories = ["development-tools::debugging"]
 
