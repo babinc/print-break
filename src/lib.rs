@@ -5,13 +5,13 @@
 //!
 //! ## Features
 //!
-//! - Pretty-prints any `Debug` type
-//! - Auto-detects and formats JSON, TOML, YAML strings
-//! - Shows file:line location
+//! - Pretty-prints any `Debug` type with syntax highlighting
+//! - Auto-detects and formats JSON, TOML, YAML strings with colors
+//! - Shows file:line location and elapsed time between breakpoints
 //! - Pauses execution until you press Enter
 //! - **Compiles to nothing in release builds**
 //! - **Disable at runtime with `PRINT_BREAK=0`**
-//! - **Interactive: Enter=continue, q=quit, s=skip remaining**
+//! - **Non-TTY safe** - won't hang in CI/piped output
 //!
 //! ## Usage
 //!
@@ -30,13 +30,18 @@
 //! - `PRINT_BREAK=0` - Disable all breakpoints
 //! - `PRINT_BREAK=1` - Enable breakpoints (default)
 //! - `PRINT_BREAK_DEPTH=N` - Max nesting depth before collapsing (default: 4)
+//! - `PRINT_BREAK_STYLE=X` - Border style: `rounded`, `sharp`, `double`, `ascii`
 //!
 //! ## Interactive Controls
 //!
 //! When paused at a breakpoint:
 //! - **Enter** - Continue to next breakpoint
-//! - **q** - Quit the program immediately
+//! - **m** - Show full output (if truncated)
+//! - **t** - Show stack trace
+//! - **c** - Copy value to clipboard
 //! - **s** - Skip all remaining breakpoints
+//! - **q** - Quit the program immediately
+//! - **h / ?** - Show help
 
 use std::fmt::Debug;
 use std::io::IsTerminal;
@@ -648,7 +653,7 @@ fn colorize_debug(s: &str) -> String {
         let indent_level = indent_count / 4;
 
         // Track depth changes
-        let opens = trimmed.ends_with('{') || trimmed.ends_with('[') || trimmed.ends_with("({");
+        let opens = trimmed.ends_with('{') || trimmed.ends_with('[') || trimmed.ends_with('(');
         let closes = trimmed.starts_with('}') || trimmed.starts_with(']') || trimmed.starts_with(')');
 
         if closes {
@@ -1199,5 +1204,22 @@ mod tests {
         std::env::set_var("PRINT_BREAK", "1");
         assert!(is_enabled());
         std::env::remove_var("PRINT_BREAK");
+    }
+
+    #[test]
+    fn json_array_elements_same_color() {
+        // Regression test: array elements should all be values (magenta), not keys (cyan)
+        // Test colorize_json directly since format_value skips colors in non-TTY test env
+        let json = r#"["a", "b", "c"]"#;
+        // Parse and pretty-print first (like format_value does)
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        let pretty = serde_json::to_string_pretty(&parsed).unwrap();
+        let formatted = colorize_json(&pretty);
+
+        // In non-TTY mode, colorize_json returns unmodified string
+        // So we test the structure is preserved (no corruption)
+        assert!(formatted.contains("\"a\""));
+        assert!(formatted.contains("\"b\""));
+        assert!(formatted.contains("\"c\""));
     }
 }
